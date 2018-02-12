@@ -22,6 +22,7 @@
     'defines': [
       'USE_BRILLO=1',
       '_FILE_OFFSET_BITS=64',
+      'ZLIB_CONST',
     ],
   },
   'targets': [
@@ -92,6 +93,11 @@
         'libpuffpatch-static',
       ],
       'all_dependent_settings': {
+        'variables': {
+          'deps': [
+            'zlib',
+          ],
+        },
         'link_settings': {
           'libraries': [
             '-lbsdiff',
@@ -166,6 +172,24 @@
             'src/puffin_unittest.cc',
             'src/stream_unittest.cc',
             'src/utils_unittest.cc',
+          ],
+        },
+      ],
+    }],
+    # fuzzer target
+    ['USE_fuzzer == 1', {
+      'targets': [
+        {
+          'target_name': 'puffin_fuzzer',
+          'type': 'executable',
+          'dependencies': [
+            'libpuffin-proto',
+            'libpuffdiff-static',
+            'libpuffpatch-static',
+          ],
+          'includes': ['../../platform2/common-mk/common_fuzzer.gypi'],
+          'sources': [
+            'src/fuzzer.cc',
           ],
         },
       ],
