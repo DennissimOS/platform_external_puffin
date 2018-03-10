@@ -88,56 +88,38 @@ size_t BytesInByteExtents(const vector<ByteExtent>& extents) {
 }
 
 // This function uses RFC1950 (https://www.ietf.org/rfc/rfc1950.txt) for the
-// definition of a zlib stream.
-bool LocateDeflatesInZlibBlocks(const UniqueStreamPtr& src,
-                                const vector<ByteExtent>& zlibs,
-                                vector<BitExtent>* deflates) {
-  for (auto& zlib : zlibs) {
-    TEST_AND_RETURN_FALSE(src->Seek(zlib.offset));
-    uint16_t zlib_header;
-    TEST_AND_RETURN_FALSE(src->Read(&zlib_header, 2));
-    BufferBitReader bit_reader(reinterpret_cast<uint8_t*>(&zlib_header), 2);
+// definition of a zlib stream.  For finding the deflate blocks, we relying on
+// the proper size of the zlib stream in |data|. Basically the size of the zlib
+// stream should be known before hand. Otherwise we need to parse the stream and
+// find the location of compressed blocks using CalculateSizeOfDeflateBlock().
+bool LocateDeflatesInZlib(const Buffer& data,
+                          std::vector<ByteExtent>* deflate_blocks) {
+  // A zlib stream has the following format:
+  // 0           1     compression method and flag
+  // 1           1     flag
+  // 2           4     preset dictionary (optional)
+  // 2 or 6      n     compressed data
+  // n+(2 or 6)  4     Adler-32 checksum
+  TEST_AND_RETURN_FALSE(data.size() >= 6 + 4);  // Header + Footer
+  uint16_t cmf = data[0];
+  auto compression_method = cmf & 0x0F;
+  // For deflate compression_method should be 8.
+  TEST_AND_RETURN_FALSE(compression_method == 8);
 
-    TEST_AND_RETURN_FALSE(bit_reader.CacheBits(8));
-    auto cmf = bit_reader.ReadBits(8);
-    auto cm = bit_reader.ReadBits(4);
-    if (cm != 8 && cm != 15) {
-      LOG(ERROR) << "Invalid compression method! cm: " << cm;
-      return false;
-    }
-    bit_reader.DropBits(4);
-    auto cinfo = bit_reader.ReadBits(4);
-    if (cinfo > 7) {
-      LOG(ERROR) << "cinfo greater than 7 is not allowed in deflate";
-      return false;
-    }
-    bit_reader.DropBits(4);
+  auto cinfo = (cmf & 0xF0) >> 4;
+  // Value greater than 7 is not allowed in deflate.
+  TEST_AND_RETURN_FALSE(cinfo <= 7);
 
-    TEST_AND_RETURN_FALSE(bit_reader.CacheBits(8));
-    auto flg = bit_reader.ReadBits(8);
-    if (((cmf << 8) + flg) % 31) {
-      LOG(ERROR) << "Invalid zlib header on offset: " << zlib.offset;
-      return false;
-    }
-    bit_reader.ReadBits(5);  // FCHECK
-    bit_reader.DropBits(5);
+  auto flag = data[1];
+  TEST_AND_RETURN_FALSE(((cmf << 8) + flag) % 31 == 0);
 
-    auto fdict = bit_reader.ReadBits(1);
-    bit_reader.DropBits(1);
-
-    bit_reader.ReadBits(2);  // FLEVEL
-    bit_reader.DropBits(2);
-
-    auto header_len = 2;
-    if (fdict) {
-      TEST_AND_RETURN_FALSE(bit_reader.CacheBits(32));
-      bit_reader.DropBits(32);
-      header_len += 4;
-    }
-
-    ByteExtent deflate(zlib.offset + header_len, zlib.length - header_len - 4);
-    TEST_AND_RETURN_FALSE(FindDeflateSubBlocks(src, {deflate}, deflates));
+  size_t header_len = 2;
+  if (flag & 0x20) {
+    header_len += 4;  // 4 bytes for the preset dictionary.
   }
+
+  // 4 is for ADLER32.
+  deflate_blocks->emplace_back(header_len, data.size() - header_len - 4);
   return true;
 }
 
@@ -173,7 +155,99 @@ bool LocateDeflatesInZlibBlocks(const string& file_path,
                                 vector<BitExtent>* deflates) {
   auto src = FileStream::Open(file_path, true, false);
   TEST_AND_RETURN_FALSE(src);
-  return LocateDeflatesInZlibBlocks(src, zlibs, deflates);
+
+  Buffer buffer;
+  for (auto& zlib : zlibs) {
+    buffer.resize(zlib.length);
+    TEST_AND_RETURN_FALSE(src->Seek(zlib.offset));
+    TEST_AND_RETURN_FALSE(src->Read(buffer.data(), buffer.size()));
+
+    vector<ByteExtent> deflate_blocks;
+    TEST_AND_RETURN_FALSE(LocateDeflatesInZlib(buffer, &deflate_blocks));
+
+    vector<BitExtent> deflate_subblocks;
+    auto zlib_blc_src = MemoryStream::CreateForRead(buffer);
+    TEST_AND_RETURN_FALSE(
+        FindDeflateSubBlocks(zlib_blc_src, deflate_blocks, &deflate_subblocks));
+
+    // Relocated based on the offset of the zlib.
+    for (const auto& def : deflate_subblocks) {
+      deflates->emplace_back(zlib.offset * 8 + def.offset, def.length);
+    }
+  }
+  return true;
+}
+
+// For more information about gzip format, refer to RFC 1952 located at:
+// https://www.ietf.org/rfc/rfc1952.txt
+bool LocateDeflatesInGzip(const Buffer& data,
+                          vector<ByteExtent>* deflate_blocks) {
+  size_t member_start = 0;
+  while (member_start < data.size()) {
+    // Each member entry has the following format
+    // 0      1     0x1F
+    // 1      1     0x8B
+    // 2      1     compression method (8 denotes deflate)
+    // 3      1     set of flags
+    // 4      4     modification time
+    // 8      1     extra flags
+    // 9      1     operating system
+    TEST_AND_RETURN_FALSE(member_start + 10 <= data.size());
+    TEST_AND_RETURN_FALSE(data[member_start + 0] == 0x1F);
+    TEST_AND_RETURN_FALSE(data[member_start + 1] == 0x8B);
+    TEST_AND_RETURN_FALSE(data[member_start + 2] == 8);
+
+    size_t offset = member_start + 10;
+    int flag = data[member_start + 3];
+    // Extra field
+    if (flag & 4) {
+      TEST_AND_RETURN_FALSE(offset + 2 <= data.size());
+      uint16_t extra_length = data[offset++];
+      extra_length |= static_cast<uint16_t>(data[offset++]) << 8;
+      TEST_AND_RETURN_FALSE(offset + extra_length <= data.size());
+      offset += extra_length;
+    }
+    // File name field
+    if (flag & 8) {
+      while (true) {
+        TEST_AND_RETURN_FALSE(offset + 1 <= data.size());
+        if (data[offset++] == 0) {
+          break;
+        }
+      }
+    }
+    // File comment field
+    if (flag & 16) {
+      while (true) {
+        TEST_AND_RETURN_FALSE(offset + 1 <= data.size());
+        if (data[offset++] == 0) {
+          break;
+        }
+      }
+    }
+    // CRC16 field
+    if (flag & 2) {
+      offset += 2;
+    }
+
+    size_t compressed_size, uncompressed_size;
+    TEST_AND_RETURN_FALSE(CalculateSizeOfDeflateBlock(
+        data, offset, &compressed_size, &uncompressed_size));
+    TEST_AND_RETURN_FALSE(offset + compressed_size <= data.size());
+    deflate_blocks->push_back(ByteExtent(offset, compressed_size));
+    offset += compressed_size;
+
+    // Ignore CRC32;
+    TEST_AND_RETURN_FALSE(offset + 8 <= data.size());
+    offset += 4;
+    uint32_t u_size = 0;
+    for (size_t i = 0; i < 4; i++) {
+      u_size |= static_cast<uint32_t>(data[offset++]) << (i * 8);
+    }
+    TEST_AND_RETURN_FALSE(uncompressed_size % (1 << 31) == u_size);
+    member_start = offset;
+  }
+  return true;
 }
 
 // For more information about the zip format, refer to
